@@ -5,8 +5,8 @@
 
 | Пакет | Отвечает за |
 |---|---|
-| **`pkg/logger`** | Единый логгер для сервиса: JSON-вывод, уровни, printf-сахар (`Infof/Warnf/…`), сквозной `request_id` через `context` и HTTP. |
-| **`pkg/masklog`** | Маскирование чувствительных полей структур **по тегам** (`log:"mask" mask:"pan"`, `log:"drop"`). Работает и в slog, и в `fmt`. |
+| **`logger`** | Единый логгер для сервиса: JSON-вывод, уровни, printf-сахар (`Infof/Warnf/…`), сквозной `request_id` через `context` и HTTP. |
+| **`masklog`** | Маскирование чувствительных полей структур **по тегам** (`log:"mask" mask:"pan"`, `log:"drop"`). Работает и в slog, и в `fmt`. |
 
 Пакеты ортогональны: `logger` пишет логи, `masklog` делает значение безопасным
 перед записью. Типичный вызов объединяет оба:
@@ -21,20 +21,19 @@ logger.C(ctx).Info("partner reply", "resp", masklog.V(resp))
 
 ```
 .
-├── go.mod                  module test, Go 1.25, без сторонних зависимостей
+├── go.mod                  module logger-mask, Go 1.25, без сторонних зависимостей
 ├── main.go                 демо: PartnerResponse/ServerRequest + логирование
 ├── README.md
-└── pkg/
-    ├── logger/              логгер-фасад над log/slog
-    │   ├── logger.go          Config, New, printf-сахар, структурные методы, default
-    │   ├── context.go         request_id: WithRequestID/C/Into/Middleware/Inject…
-    │   ├── logger_test.go
-    │   └── bench_test.go      аллокации на запись
-    └── masklog/             маскирование структур по тегам
-        ├── mask.go            функции маскирования pan/last4/first4/bin/ip/…
-        ├── tags.go            разбор тегов log/mask + кэш описаний типов
-        ├── value.go           V()=slog.LogValuer+fmt.Formatter, Format()
-        └── masklog_test.go
+├── logger/                 логгер-фасад над log/slog
+│   ├── logger.go             Config, New, printf-сахар, структурные методы, default
+│   ├── context.go            request_id: WithRequestID/C/Into/Middleware/Inject…
+│   ├── logger_test.go
+│   └── bench_test.go         аллокации на запись
+└── masklog/                маскирование структур по тегам
+    ├── mask.go               функции маскирования pan/last4/first4/bin/ip/…
+    ├── tags.go               разбор тегов log/mask + кэш описаний типов
+    ├── value.go              V()=slog.LogValuer+fmt.Formatter, Format()
+    └── masklog_test.go
 ```
 
 Пакеты независимы друг от друга: `masklog` не знает про `logger`, `logger` не знает
@@ -51,8 +50,8 @@ import (
 	"context"
 	"log/slog"
 
-	"test/pkg/logger"
-	"test/pkg/masklog"
+	"logger-mask/logger"
+	"logger-mask/masklog"
 )
 
 // Тело входящего запроса: account — последние 4, device_id — первые 4,
@@ -146,7 +145,7 @@ func main() {
 
 ---
 
-## `pkg/logger` — логгер
+## `logger` — логгер
 
 ### Создание
 
@@ -235,7 +234,7 @@ logger.C(ctx).Info("...")         // логгер с полем request_id
 
 ---
 
-## `pkg/masklog` — маскирование по тегам
+## `masklog` — маскирование по тегам
 
 ### Теги
 
@@ -313,12 +312,12 @@ func (r ServerRequest) GoString() string { return masklog.Format(r) }
 go build ./...
 go vet ./...
 go test -count=1 ./...
-go test -run=^$ -bench=. -benchmem ./pkg/logger/   # аллокации на запись
+go test -run=^$ -bench=. -benchmem ./logger/   # аллокации на запись
 ```
 
 ## Переиспользование в других проектах
 
-Сейчас пакеты лежат в этом же модуле (`import "test/pkg/logger"`,
-`"test/pkg/masklog"`). Чтобы шарить между сервисами через `go get`, вынеси
-`pkg/logger` и `pkg/masklog` в отдельный Go-модуль/репозиторий — внешних
+Сейчас пакеты лежат в этом же модуле (`import "logger-mask/logger"`,
+`"logger-mask/masklog"`). Чтобы шарить между сервисами через `go get`, вынеси
+`logger` и `masklog` в отдельный Go-модуль/репозиторий — внешних
 зависимостей у них нет, так что перенос тривиален.

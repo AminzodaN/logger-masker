@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 type sample struct {
@@ -92,6 +93,47 @@ func TestFormatNilAndCycleSafe(t *testing.T) {
 	n.Next = n // self-reference
 	if got := Format(n); !strings.Contains(got, "cycle") {
 		t.Errorf("cycle not detected: %s", got)
+	}
+}
+
+// TestNonTaggedStringishPreserved проверяет, что нетегированное поле-структура,
+// чьё значение живёт в методах (time.Time), не схлопывается в пустую группу, а
+// выводится своей текстовой формой — в обоих путях (slog и fmt).
+func TestNonTaggedStringishPreserved(t *testing.T) {
+	type receipt struct {
+		TxID      string    `json:"tx_id"`
+		CreatedAt time.Time `json:"created_at"`
+		Amount    int       `json:"amount"`
+	}
+	r := receipt{
+		TxID:      "P-1",
+		CreatedAt: time.Date(2026, 10, 27, 10, 0, 0, 0, time.UTC),
+		Amount:    500,
+	}
+	const wantTime = "2026-10-27T10:00:00Z" // RFC3339 через TextMarshaler
+
+	// slog-путь: created_at должен присутствовать как строка со временем.
+	var buf bytes.Buffer
+	slog.New(slog.NewJSONHandler(&buf, nil)).Info("x", "receipt", V(r))
+	var rec map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &rec); err != nil {
+		t.Fatalf("not JSON: %v", err)
+	}
+	got, _ := rec["receipt"].(map[string]any)
+	if got == nil {
+		t.Fatalf("receipt missing: %s", buf.String())
+	}
+	if got["created_at"] != wantTime {
+		t.Errorf("slog created_at = %v, want %q", got["created_at"], wantTime)
+	}
+
+	// fmt-путь: Format не должен печатать created_at:{} и обязан содержать время.
+	s := Format(r)
+	if strings.Contains(s, "created_at:{}") {
+		t.Errorf("Format collapsed time to empty struct: %s", s)
+	}
+	if !strings.Contains(s, wantTime) {
+		t.Errorf("Format missing time %q: %s", wantTime, s)
 	}
 }
 

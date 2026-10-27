@@ -1,6 +1,7 @@
 package masklog
 
 import (
+	"encoding"
 	"fmt"
 	"io"
 	"log/slog"
@@ -44,6 +45,13 @@ func (val Value) LogValue() (out slog.Value) {
 		return slog.AnyValue(nil)
 	}
 	if rv.Kind() == reflect.Struct {
+		// Тип без своих экспортируемых полей (time.Time, uuid, decimal, …)
+		// иначе дал бы пустую группу — берём его текстовую форму.
+		if len(describe(rv.Type()).fields) == 0 {
+			if s, ok := stringish(rv); ok {
+				return slog.StringValue(s)
+			}
+		}
 		return slog.GroupValue(structAttrs(rv)...)
 	}
 	// Верхний уровень не структура: отдаём безопасную строковую форму.
@@ -81,6 +89,13 @@ func naturalAttr(name string, fv reflect.Value) slog.Attr {
 	switch rv.Kind() {
 	case reflect.Struct:
 		if rv.CanInterface() {
+			// time.Time и прочие типы «значение в методах» без экспортируемых
+			// полей иначе схлопнулись бы в пустую группу — отдаём их текст.
+			if len(describe(rv.Type()).fields) == 0 {
+				if s, ok := stringish(rv); ok {
+					return slog.String(name, s)
+				}
+			}
 			return slog.Any(name, V(rv.Interface()))
 		}
 	case reflect.String:
@@ -161,6 +176,14 @@ func formatValue(b *strings.Builder, rv reflect.Value, depth int, seen map[uintp
 		}
 		formatValue(b, rv.Elem(), depth, seen)
 	case reflect.Struct:
+		// Зеркало slog-ветки: тип без экспортируемых полей (time.Time и т.п.)
+		// печатаем его текстовой формой, а не как пустую структуру {}.
+		if len(describe(rv.Type()).fields) == 0 {
+			if s, ok := stringish(rv); ok {
+				b.WriteString(s)
+				return
+			}
+		}
 		formatStruct(b, rv, depth, seen)
 	case reflect.Slice, reflect.Array:
 		if rv.Kind() == reflect.Slice && !rv.IsNil() {
@@ -279,6 +302,29 @@ func leafString(rv reflect.Value) string {
 		return fmt.Sprint(rv.Interface())
 	}
 	return ""
+}
+
+// stringish возвращает текстовую форму для типов, чьё значение живёт в методах,
+// а не в экспортируемых полях (time.Time, uuid.UUID, decimal.Decimal и т.п.).
+// Без этого такой тип схлопнулся бы в пустую группу (slog выкинул бы ключ, fmt
+// напечатал бы {}), т.к. describe не видит у него полей для вывода. Предпочитает
+// encoding.TextMarshaler (у time.Time это RFC3339), затем fmt.Stringer; ok=false,
+// если тип не реализует ни того, ни другого. Ошибку MarshalText глотаем и
+// откатываемся к Stringer — fail-closed, сырьё в лог не попадает.
+func stringish(rv reflect.Value) (string, bool) {
+	if !rv.CanInterface() {
+		return "", false
+	}
+	v := rv.Interface()
+	if tm, ok := v.(encoding.TextMarshaler); ok {
+		if b, err := tm.MarshalText(); err == nil {
+			return string(b), true
+		}
+	}
+	if s, ok := v.(fmt.Stringer); ok {
+		return s.String(), true
+	}
+	return "", false
 }
 
 // iface безопасно достаёт interface{} из reflect.Value для печати, подставляя
