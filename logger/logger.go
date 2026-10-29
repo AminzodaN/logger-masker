@@ -18,11 +18,17 @@ package logger
 
 import (
 	"context"
+	"encoding"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"runtime"
 	"sync"
+	"time"
+
+	"logger-mask/masklog"
 )
 
 // EnvLocal включает человекочитаемый text-вывод вместо JSON.
@@ -96,63 +102,198 @@ func (l *Logger) With(args ...any) *Logger {
 	return &Logger{sl: l.sl.With(args...)}
 }
 
-// replaceAttr нормализует метку времени к UTC RFC3339 с миллисекундами, чтобы
-// время во всех сервисах было в едином формате и часовом поясе.
+// replaceAttr нормализует метку времени и служит страховкой на выходе: даже если
+// значение не обёрнуто в masklog.V, оно маскируется перед записью. Срабатывает
+// на любом уровне групп, так что чувствительные поля не утекут из вложенных
+// структур, сырых тел, текста ошибок и msg. Работает поверх обработчика slog,
+// уже прошедшего Value.Resolve (обёртки masklog.V к этому моменту раскрыты).
 func replaceAttr(groups []string, a slog.Attr) slog.Attr {
+	// Время -> UTC RFC3339 с миллисекундами (единый формат во всех сервисах).
 	if len(groups) == 0 && a.Key == slog.TimeKey {
 		if t := a.Value.Time(); !t.IsZero() {
 			a.Value = slog.StringValue(t.UTC().Format("2006-01-02T15:04:05.000Z07:00"))
+		}
+		return a
+	}
+	// Служебные level/source не трогаем.
+	if len(groups) == 0 && (a.Key == slog.LevelKey || a.Key == slog.SourceKey) {
+		return a
+	}
+	// Ключи из стоп-списка на любом уровне групп -> маска по правилу ключа
+	// (drop-ключи => ***). Для составного значения под таким ключом — ***.
+	if masklog.Sensitive(a.Key) {
+		if a.Value.Kind() == slog.KindString {
+			return slog.String(a.Key, masklog.MaskValue(a.Key, a.Value.String()))
+		}
+		return slog.String(a.Key, masklog.Redacted)
+	}
+	return maskAttrValue(a)
+}
+
+// maskAttrValue применяет страховочную маску к значению атрибута по его виду:
+// строки (включая msg и текст ошибок) — текстовая маска; сырые []byte /
+// json.RawMessage — через JSON-движок (с fallback на текст); голые структуры /
+// map / срезы структур — через masklog.V. Значения, уже умеющие маскировать
+// себя сами (slog.LogValuer и наши обёртки-Marshaler'ы), не трогаются.
+func maskAttrValue(a slog.Attr) slog.Attr {
+	switch a.Value.Kind() {
+	case slog.KindString:
+		s := a.Value.String()
+		if m := masklog.MaskString(s); m != s {
+			return slog.String(a.Key, m)
+		}
+		return a // быстрый путь: ничего не поменялось, 0 аллокаций
+	case slog.KindAny:
+		switch v := a.Value.Any().(type) {
+		case slog.LogValuer:
+			return a
+		case error:
+			return slog.String(a.Key, masklog.MaskString(v.Error()))
+		case []byte:
+			return slog.Any(a.Key, masklog.JSON(v))
+		case json.RawMessage:
+			return slog.Any(a.Key, masklog.JSON(v))
+		case json.Marshaler:
+			return a // наши jsonBody/slogJSONArray и пользовательские маршалеры
+		case encoding.TextMarshaler:
+			return a
+		default:
+			if masklog.ShouldWrap(v) {
+				return slog.Any(a.Key, masklog.V(v))
+			}
+			return a
 		}
 	}
 	return a
 }
 
-// --- printf-сахар ------------------------------------------------------------
+// --- ядро записи -------------------------------------------------------------
 
-// logf — общая реализация всех *f-методов: проверяет уровень (чтобы не платить
-// за fmt.Sprintf, когда уровень выключен) и пишет отформатированное сообщение.
-func (l *Logger) logf(level slog.Level, format string, args ...any) {
-	if !l.sl.Enabled(context.Background(), level) {
+// log — общее ядро структурных методов. Захватывает PC места вызова через
+// runtime.Callers и пишет запись через Handler().Handle, чтобы AddSource
+// указывал на место вызова, а не на logger.go (см. «wrapping output methods» в
+// документации log/slog). ctx пробрасывается в Handle — handler'ы, читающие
+// trace_id из ctx, его видят.
+func (l *Logger) log(ctx context.Context, level slog.Level, msg string, args ...any) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !l.sl.Enabled(ctx, level) {
 		return
 	}
-	l.sl.Log(context.Background(), level, fmt.Sprintf(format, args...))
+	var pcs [1]uintptr
+	runtime.Callers(3, pcs[:]) // пропустить [Callers, log, публичный метод]
+	r := slog.NewRecord(time.Now(), level, msg, pcs[0])
+	r.Add(args...)
+	_ = l.sl.Handler().Handle(ctx, r)
 }
 
+// logf — ядро printf-методов: проверяет уровень (чтобы не платить за Sprintf при
+// выключенном уровне) и пишет отформатированное сообщение с PC места вызова.
+func (l *Logger) logf(ctx context.Context, level slog.Level, format string, args ...any) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !l.sl.Enabled(ctx, level) {
+		return
+	}
+	var pcs [1]uintptr
+	runtime.Callers(3, pcs[:]) // пропустить [Callers, logf, публичный метод]
+	r := slog.NewRecord(time.Now(), level, fmt.Sprintf(format, args...), pcs[0])
+	_ = l.sl.Handler().Handle(ctx, r)
+}
+
+// --- printf-сахар ------------------------------------------------------------
+
 // Debugf пишет форматированное сообщение на уровне debug.
-func (l *Logger) Debugf(format string, args ...any) { l.logf(slog.LevelDebug, format, args...) }
+func (l *Logger) Debugf(format string, args ...any) {
+	l.logf(context.Background(), slog.LevelDebug, format, args...)
+}
 
 // Infof пишет форматированное сообщение на уровне info.
-func (l *Logger) Infof(format string, args ...any) { l.logf(slog.LevelInfo, format, args...) }
+func (l *Logger) Infof(format string, args ...any) {
+	l.logf(context.Background(), slog.LevelInfo, format, args...)
+}
 
 // Warnf пишет форматированное сообщение на уровне warn.
-func (l *Logger) Warnf(format string, args ...any) { l.logf(slog.LevelWarn, format, args...) }
+func (l *Logger) Warnf(format string, args ...any) {
+	l.logf(context.Background(), slog.LevelWarn, format, args...)
+}
 
 // Errorf пишет форматированное сообщение на уровне error.
-func (l *Logger) Errorf(format string, args ...any) { l.logf(slog.LevelError, format, args...) }
+func (l *Logger) Errorf(format string, args ...any) {
+	l.logf(context.Background(), slog.LevelError, format, args...)
+}
 
 // Printf — алиас Infof для drop-in замены Printf из стандартного пакета log.
-func (l *Logger) Printf(format string, args ...any) { l.logf(slog.LevelInfo, format, args...) }
+func (l *Logger) Printf(format string, args ...any) {
+	l.logf(context.Background(), slog.LevelInfo, format, args...)
+}
 
 // Fatalf пишет сообщение на уровне error и завершает процесс с кодом 1.
 // Использовать только на старте / в main.
 func (l *Logger) Fatalf(format string, args ...any) {
-	l.logf(slog.LevelError, format, args...)
+	l.logf(context.Background(), slog.LevelError, format, args...)
 	os.Exit(1)
+}
+
+// printf-сахар с явным контекстом (для handler'ов, читающих trace_id из ctx).
+
+// DebugfContext — Debugf с контекстом.
+func (l *Logger) DebugfContext(ctx context.Context, format string, args ...any) {
+	l.logf(ctx, slog.LevelDebug, format, args...)
+}
+
+// InfofContext — Infof с контекстом.
+func (l *Logger) InfofContext(ctx context.Context, format string, args ...any) {
+	l.logf(ctx, slog.LevelInfo, format, args...)
+}
+
+// WarnfContext — Warnf с контекстом.
+func (l *Logger) WarnfContext(ctx context.Context, format string, args ...any) {
+	l.logf(ctx, slog.LevelWarn, format, args...)
+}
+
+// ErrorfContext — Errorf с контекстом.
+func (l *Logger) ErrorfContext(ctx context.Context, format string, args ...any) {
+	l.logf(ctx, slog.LevelError, format, args...)
 }
 
 // --- структурный проброс -----------------------------------------------------
 
 // Debug пишет msg с парами ключ-значение на уровне debug.
-func (l *Logger) Debug(msg string, args ...any) { l.sl.Debug(msg, args...) }
+func (l *Logger) Debug(msg string, args ...any) { l.log(context.Background(), slog.LevelDebug, msg, args...) }
 
 // Info пишет msg с парами ключ-значение на уровне info.
-func (l *Logger) Info(msg string, args ...any) { l.sl.Info(msg, args...) }
+func (l *Logger) Info(msg string, args ...any) { l.log(context.Background(), slog.LevelInfo, msg, args...) }
 
 // Warn пишет msg с парами ключ-значение на уровне warn.
-func (l *Logger) Warn(msg string, args ...any) { l.sl.Warn(msg, args...) }
+func (l *Logger) Warn(msg string, args ...any) { l.log(context.Background(), slog.LevelWarn, msg, args...) }
 
 // Error пишет msg с парами ключ-значение на уровне error.
-func (l *Logger) Error(msg string, args ...any) { l.sl.Error(msg, args...) }
+func (l *Logger) Error(msg string, args ...any) { l.log(context.Background(), slog.LevelError, msg, args...) }
+
+// структурный проброс с явным контекстом.
+
+// DebugContext — Debug с контекстом.
+func (l *Logger) DebugContext(ctx context.Context, msg string, args ...any) {
+	l.log(ctx, slog.LevelDebug, msg, args...)
+}
+
+// InfoContext — Info с контекстом.
+func (l *Logger) InfoContext(ctx context.Context, msg string, args ...any) {
+	l.log(ctx, slog.LevelInfo, msg, args...)
+}
+
+// WarnContext — Warn с контекстом.
+func (l *Logger) WarnContext(ctx context.Context, msg string, args ...any) {
+	l.log(ctx, slog.LevelWarn, msg, args...)
+}
+
+// ErrorContext — Error с контекстом.
+func (l *Logger) ErrorContext(ctx context.Context, msg string, args ...any) {
+	l.log(ctx, slog.LevelError, msg, args...)
+}
 
 // --- процессный default -------------------------------------------------------
 

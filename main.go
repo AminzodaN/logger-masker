@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 
 	"logger-mask/logger"
@@ -67,6 +68,9 @@ func main() {
 		Holder: "Alisher Karimov",
 		CVV:    "123",
 	}
+
+	body, _ := json.Marshal(resp)
+	logger.C(ctx).Infof("--------------%s", body)
 
 	// Структурный вызов: тело запроса и ответа — вложенные группы с маскированием
 	// по тегам, request_id из ctx проставляется автоматически через logger.C.

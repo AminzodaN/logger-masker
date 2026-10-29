@@ -13,6 +13,9 @@ const (
 	actNone action = iota // выводить как есть
 	actDrop               // никогда не выводить
 	actMask               // необратимо замаскировать
+	actJSON               // тело-JSON: разобрать и замаскировать по ключам/значениям
+	actXML                // тело-XML/SOAP: то же по локальным именам
+	actText               // произвольный текст: маскировать только по значениям
 )
 
 // fieldRule описывает, как логировать одно поле структуры.
@@ -52,6 +55,12 @@ func describe(t reflect.Type) *structDesc {
 		case "mask":
 			fr.act = actMask
 			fr.maskType = f.Tag.Get("mask")
+		case "json":
+			fr.act = actJSON
+		case "xml":
+			fr.act = actXML
+		case "text":
+			fr.act = actText
 		default:
 			// Неизвестный тег: fail-closed, маскируем дефолтным правилом.
 			fr.act = actMask

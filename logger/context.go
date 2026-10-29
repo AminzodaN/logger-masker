@@ -6,9 +6,18 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// reRequestID задаёт допустимую форму входящего идентификатора запроса:
+// [A-Za-z0-9_-]{1,128}. Чужой заголовок не доверенный — не даём затащить в логи
+// управляющие символы, переводы строк или гигантские значения.
+var reRequestID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+// validRequestID проверяет, что id пригоден для использования как request_id.
+func validRequestID(id string) bool { return reRequestID.MatchString(id) }
 
 // RequestIDField — имя поля лога, под которым пишется идентификатор запроса.
 const RequestIDField = "request_id"
@@ -114,12 +123,12 @@ func InjectRequestID(ctx context.Context, r *http.Request) {
 // requestIDFromRequest выбирает идентификатор для входящего запроса: сперва
 // X-Request-Id, затем trace-id из traceparent, иначе генерит новый.
 func requestIDFromRequest(r *http.Request) string {
-	if rid := r.Header.Get(HeaderRequestID); rid != "" {
+	if rid := r.Header.Get(HeaderRequestID); validRequestID(rid) {
 		return rid
 	}
 	if tp := r.Header.Get("traceparent"); tp != "" {
 		// traceparent = version-traceid-spanid-flags; берём часть trace-id.
-		if parts := strings.SplitN(tp, "-", 3); len(parts) >= 2 && parts[1] != "" {
+		if parts := strings.SplitN(tp, "-", 3); len(parts) >= 2 && validRequestID(parts[1]) {
 			return parts[1]
 		}
 	}
